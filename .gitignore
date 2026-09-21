@@ -1,0 +1,66 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg-info
+
+# Environments
+.venv/
+env/
+venv/
+.env
+
+# VS Code & OS files
+.vscode/
+.DS_Store
+
+# データセットや出力結果が入るフォルダ
+data/
+datasets/
+outputs/
+renders/
+nerf_example_data/
+*.npz
+
+# zip / tar / 7z / rar / gz / bz2 / csv / tsv
+*.zip
+*.tar
+*.7z
+*.rar
+*.gz
+*.bz2
+*.csv
+*.tsv
+*.Identifier
+
+
+# 画像・動画ファイル
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+
+# 3Dモデル・ポイントクラウドファイル
+*.ply
+*.obj
+*.splat
+
+# PyTorch & Machine Learning Models
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# 公開用
+!assets/**/*.ply
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.mp4
