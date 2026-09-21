@@ -6,15 +6,12 @@ import japanize_matplotlib  # noqa: F401
 import numpy as np
 import torch
 import torch.nn.functional as F
-import warp as wp
-from torch.optim import Adam
 
 from warpgs.dataset import NeRFSyntheticDataloader
-from warpgs.model import GaussianModel, densify_and_prune
-from warpgs.my_warp_rasterizer import WarpRasterizeFunction
+from warpgs.densification import Densification
+from warpgs.model import GaussianModel, create_optimizers
 from warpgs.ply import save_ply
-
-wp.init()
+from warpgs.renderers import create_renderer
 
 
 # 損失関数
@@ -69,20 +66,6 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     return psnr.item()
 
 
-def render(model: GaussianModel, w2c: torch.Tensor, K: torch.Tensor, H: int, W: int, bg_color: torch.Tensor) -> tuple:
-    """
-    自作のWarpラスタライザを使って画像をレンダリングする
-    """
-    # WarpRasterizeFunction.apply を呼び出す
-    # 各プロパティ (scales, opacities, colors) は内部で exp や sigmoid が適用済みのテンソル
-    image = WarpRasterizeFunction.apply(
-        model.means, model.quats, model.scales, model.opacities, model.colors, w2c, K, H, W, bg_color
-    )
-
-    # train() 側で unpack エラーにならないよう、ダミーの info (None) を返す
-    return image, None
-
-
 # メイン学習ループ
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,16 +77,28 @@ def train(args):
     print(f"[train] image size: {H}x{W}, device: {device}")
 
     # モデル初期化
-    model = GaussianModel.from_random(
-        num_gaussians=args.num_init_gaussians,
-        scene_radius=1.5,  # lego シーンの bounding radius
-        init_scale=0.05,
-        device=device,
+    if args.init_checkpoint:
+        model = GaussianModel.load(args.init_checkpoint, device=device)
+    else:
+        model = GaussianModel.from_random(
+            num_gaussians=args.num_init_gaussians,
+            scene_radius=1.5,
+            init_scale=0.05,
+            device=device,
+        )
+    optimizers = create_optimizers(model)
+    controller = Densification(args.renderer, args.densification, args)
+    renderer = create_renderer(
+        args.renderer,
+        packed=args.packed,
+        absgrad=args.absgrad and args.renderer == "gsplat" and args.densification == "default",
     )
-    optimizer = Adam(model.get_optimizer_params())
+    controller.check_sanity(model, optimizers)
 
-    print(f"[train] initial Gaussians: {model.num_gaussians()}")
-
+    print(
+        f"[train] renderer={renderer.name}, densification={controller.name}, "
+        f"initial Gaussians={model.num_gaussians()}"
+    )
     # 出力ディレクトリ
     out_dir = Path(args.output_dir)
     (out_dir / "images").mkdir(parents=True, exist_ok=True)
@@ -117,28 +112,27 @@ def train(args):
 
     for step in range(1, args.n_iters + 1):
         model.train()
-        optimizer.zero_grad()
+        for optimizer in optimizers.values():
+            optimizer.zero_grad(set_to_none=True)
 
         # ランダムに1枚サンプリング
         target_img, w2c, K = train_loader.get_random()
 
-        # フォワードパス: gsplat でレンダリング
-        pred_img, _ = render(model, w2c, K, H, W, bg_color)
+        render_output = renderer.render(model, w2c, K, H, W, bg_color)
+        pred_img = render_output.image
+        controller.before_backward(model, optimizers, step, render_output)
 
-        # 損失計算 (simple_gaussian.ipynbと同じ式)
-        loss = combined_loss(pred_img, target_img)
+        loss = combined_loss(pred_img, target_img) + controller.regularization(model)
 
         # バックワードパス
         loss.backward()
 
-        # 勾配累積 (Densification の判定に使用)
-        model.accumulate_gradients()
+        for optimizer in optimizers.values():
+            optimizer.step()
 
-        # パラメータ更新
-        optimizer.step()
-
-        # クォータニオンを正規化 (毎ステップ必須)
         model.normalize_quats()
+        # gsplat 1.5.3 の公式 trainer と同じく optimizer 更新後に呼ぶ。
+        controller.after_backward(model, optimizers, step, render_output)
 
         # ログ
         loss_val = loss.item()
@@ -157,35 +151,13 @@ def train(args):
                 f"Time: {elapsed:.0f}s"
             )
 
-        # Densification
-        # 100ステップごとに Clone/Split/Prune
-        if step >= args.densify_from and step <= args.densify_until and step % args.densify_interval == 0:
-            print(f"\n[Densify] Step {step}")
-            model, optimizer = densify_and_prune(
-                model,
-                optimizer,
-                grad_threshold=args.grad_threshold,
-                opacity_threshold=args.opacity_threshold,
-                scale_threshold=args.scale_threshold,
-                max_gaussians=args.max_gaussians,
-            )
-            model.reset_gradient_accum()
-
-        # 不透明度をリセット (論文: 3000ステップごと)
-        if step % 3000 == 0:
-            with torch.no_grad():
-                # 不透明度を 0.01 (logit ~= -4.6) にリセット
-                # -> 不要なガウシアンを Prune で削除しやすくする
-                model.logit_opacities.data.fill_(-4.6)
-            print(f"[Step {step}] opacity reset")
-
         # 定期的な画像保存
         if step % args.save_img_interval == 0 or step == args.n_iters:
             model.eval()
             with torch.no_grad():
                 # テスト用に固定カメラ (index 0) でレンダリング
                 test_img, test_w2c, test_K = train_loader.get_by_index(0)
-                pred_test, _ = render(model, test_w2c, test_K, H, W, bg_color)
+                pred_test = renderer.render(model, test_w2c, test_K, H, W, bg_color).image
                 pred_np = pred_test.clamp(0, 1).cpu().numpy()
                 target_np = test_img.cpu().numpy()
 
@@ -250,14 +222,33 @@ def parse_args():
     p.add_argument("--downscale", type=int, default=1, help="画像縮小率 (1=800x800, 2=400x400)")
     p.add_argument("--n_iters", type=int, default=10_000, help="学習ステップ数 (本格は30000)")
     p.add_argument("--num_init_gaussians", type=int, default=5_000, help="初期ガウシアン数")
+    p.add_argument("--init_checkpoint", type=Path, help="共通形式の初期 checkpoint")
+    p.add_argument("--renderer", choices=("warp", "gsplat"), default="warp")
+    p.add_argument(
+        "--packed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="gsplat packed rasterization (Warp では無視)",
+    )
+    p.add_argument("--absgrad", action="store_true", help="gsplat DefaultStrategy で absolute gradient を使う")
     # Densification
+    p.add_argument(
+        "--densification",
+        choices=("default", "mcmc"),
+        default="mcmc",
+        help="gsplat DefaultStrategy または MCMCStrategy",
+    )
     p.add_argument("--densify_from", type=int, default=500)
     p.add_argument("--densify_until", type=int, default=7_500)
     p.add_argument("--densify_interval", type=int, default=100)
     p.add_argument("--grad_threshold", type=float, default=0.0002)
     p.add_argument("--opacity_threshold", type=float, default=0.005)
-    p.add_argument("--scale_threshold", type=float, default=0.1)
     p.add_argument("--max_gaussians", type=int, default=150_000)
+    # 3DGS MCMC
+    p.add_argument("--mcmc_noise_lr", type=float, default=5e5, help="Langevin position noise の係数")
+    p.add_argument("--mcmc_noise_until", type=int, default=10_000, help="position noise を加える最終 step")
+    p.add_argument("--opacity_reg", type=float, default=0.01, help="MCMC opacity 正則化係数")
+    p.add_argument("--scale_reg", type=float, default=0.01, help="MCMC scale 正則化係数")
     # 保存
     p.add_argument("--save_img_interval", type=int, default=1000)
     p.add_argument("--save_ckpt_interval", type=int, default=5000)

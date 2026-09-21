@@ -27,12 +27,12 @@ def save_ply(model: GaussianModel, path: str) -> None:
 
     with torch.no_grad():
         means = model.means.detach().cpu().numpy()
-        colors = model.logit_colors.detach().cpu().numpy()
-        opacities = model.logit_opacities.detach().cpu().numpy()
-        scales = model.log_scales.detach().cpu().numpy()
+        colors = model.params["colors"].detach().cpu().numpy()
+        opacities = model.params["opacities"].detach().cpu().numpy()
+        scales = model.params["scales"].detach().cpu().numpy()
         quats = model.quats.detach().cpu().numpy()
 
-    # SH DC 成分への変換: RGB = sigmoid(logit_colors)
+    # SH DC 成分への変換: RGB = sigmoid(colors)
     # SH DC = (RGB - 0.5) / 0.2821  (逆変換)
     SH_C0 = 0.28209479177387814
     rgb = 1.0 / (1.0 + np.exp(-colors))  # sigmoid

@@ -115,6 +115,7 @@ def preprocess_kernel(
     means: wp.array[wp.vec3],
     scales: wp.array[wp.vec3],
     quats: wp.array[wp.quat],
+    mean_pixel: wp.array[wp.vec2],
     view_matrix_arr: wp.array[wp.mat44],
     fx: float,
     fy: float,
@@ -126,15 +127,16 @@ def preprocess_kernel(
     tiles_per_col: int,
     # 出力 (すべて元のガウシアンインデックス tid で書き込む. サイズ N)
     out_cov2d_inv: wp.array[wp.vec3],
-    out_mu_pixel: wp.array[wp.vec2],
     out_depth: wp.array[wp.float32],
     out_tile_rect: wp.array[wp.vec4i],  # (min_x, min_y, max_x, max_y)
     out_tiles_touched: wp.array[wp.int32],
+    out_radii: wp.array[wp.vec2],
 ):
     tid = wp.tid()
 
     # 可視外のデフォルト値, 早期returnする全パスでこれが有効になる
     out_tiles_touched[tid] = 0
+    out_radii[tid] = wp.vec2(0.0, 0.0)
 
     mean = means[tid]
     mean_h = wp.vec4(mean[0], mean[1], mean[2], 1.0)
@@ -153,27 +155,28 @@ def preprocess_kernel(
     #
     radius_x = GAUSSIAN_EXTENT * wp.sqrt(wp.max(data.cov2d_diag[0], 0.0))
     radius_y = GAUSSIAN_EXTENT * wp.sqrt(wp.max(data.cov2d_diag[1], 0.0))
+    mu = mean_pixel[tid]
 
     # 画面外に中心を持つ大きなGaussianも画像と交差する限り残す
-    if data.mu_pixel[0] + radius_x <= 0.0 or data.mu_pixel[0] - radius_x >= screen_w:
+    if mu[0] + radius_x <= 0.0 or mu[0] - radius_x >= screen_w:
         return
-    if data.mu_pixel[1] + radius_y <= 0.0 or data.mu_pixel[1] - radius_y >= screen_h:
+    if mu[1] + radius_y <= 0.0 or mu[1] - radius_y >= screen_h:
         return
 
     # タイル範囲は[min, max)で計算し既存の保存形式だけinclusive maxにする
-    min_x = wp.max(wp.int32(wp.floor((data.mu_pixel[0] - radius_x) / float(TILE_SIZE))), 0)
-    min_y = wp.max(wp.int32(wp.floor((data.mu_pixel[1] - radius_y) / float(TILE_SIZE))), 0)
-    max_x_exclusive = wp.min(wp.int32(wp.ceil((data.mu_pixel[0] + radius_x) / float(TILE_SIZE))), tiles_per_row)
-    max_y_exclusive = wp.min(wp.int32(wp.ceil((data.mu_pixel[1] + radius_y) / float(TILE_SIZE))), tiles_per_col)
+    min_x = wp.max(wp.int32(wp.floor((mu[0] - radius_x) / float(TILE_SIZE))), 0)
+    min_y = wp.max(wp.int32(wp.floor((mu[1] - radius_y) / float(TILE_SIZE))), 0)
+    max_x_exclusive = wp.min(wp.int32(wp.ceil((mu[0] + radius_x) / float(TILE_SIZE))), tiles_per_row)
+    max_y_exclusive = wp.min(wp.int32(wp.ceil((mu[1] + radius_y) / float(TILE_SIZE))), tiles_per_col)
 
     if max_x_exclusive <= min_x or max_y_exclusive <= min_y:
         return
 
     out_cov2d_inv[tid] = data.cov2d_inv
-    out_mu_pixel[tid] = data.mu_pixel
     out_depth[tid] = tz
     out_tile_rect[tid] = wp.vec4i(min_x, min_y, max_x_exclusive - 1, max_y_exclusive - 1)
     out_tiles_touched[tid] = (max_x_exclusive - min_x) * (max_y_exclusive - min_y)
+    out_radii[tid] = wp.vec2(radius_x, radius_y)
 
 
 @wp.kernel
@@ -379,6 +382,17 @@ def backward_render_kernel(
                 suffix_T = suffix_T * one_minus_alpha
 
 
+def project_means_to_screen(means: torch.Tensor, w2c: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    """3D中心を画像座標へ投影し、DefaultStrategyが参照できるTensorとして返す"""
+    ones = torch.ones((means.shape[0], 1), dtype=means.dtype, device=means.device)
+    means_camera = torch.cat((means, ones), dim=-1) @ w2c.T
+    z = means_camera[:, 2]
+    safe_z = torch.where(z.abs() > 1e-8, z, torch.ones_like(z))
+    x = K[0, 0] * means_camera[:, 0] / safe_z + K[0, 2]
+    y = K[1, 1] * means_camera[:, 1] / safe_z + K[1, 2]
+    return torch.stack((x, y), dim=-1).unsqueeze(0)
+
+
 class WarpRasterizeFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -388,12 +402,13 @@ class WarpRasterizeFunction(torch.autograd.Function):
         scales: torch.Tensor,
         opacities: torch.Tensor,
         colors: torch.Tensor,
+        means2d: torch.Tensor,
         w2c: torch.Tensor,
         K: torch.Tensor,
         H: int,
         W: int,
         bg_color: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         # torch.TensorをWarpのwp.arrayに変換する. contiguous()でメモリレイアウトを保証
         # GCで回収されないようにctxで保持するためownersにまとめる
@@ -403,6 +418,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
             scales.detach().contiguous(),
             opacities.detach().contiguous(),
             colors.detach().contiguous(),
+            means2d[0].detach().contiguous(),
             w2c.detach().contiguous(),
         ]
 
@@ -411,9 +427,10 @@ class WarpRasterizeFunction(torch.autograd.Function):
         scales_wp = wp.from_torch(owners[2], dtype=wp.vec3, requires_grad=True)
         opacities_wp = wp.from_torch(owners[3], dtype=wp.float32, requires_grad=True)
         colors_wp = wp.from_torch(owners[4], dtype=wp.vec3, requires_grad=True)
+        mean_pixel = wp.from_torch(owners[5], dtype=wp.vec2, requires_grad=False)
 
         # w2c (4, 4) を (1, 4, 4) に変形し, 長さ1のwp.mat44 の配列として Warp にマッピングする
-        w2c_1_4_4 = owners[5].view(1, 4, 4)
+        w2c_1_4_4 = owners[6].view(1, 4, 4)
         view_matrix_arr = wp.from_torch(w2c_1_4_4, dtype=wp.mat44, requires_grad=False)
 
         bg_wp = wp.vec3(float(bg_color[0].item()), float(bg_color[1].item()), float(bg_color[2].item()))
@@ -430,8 +447,8 @@ class WarpRasterizeFunction(torch.autograd.Function):
         # warp arrayの確保
         n = means.shape[0]
         cov2d_inv = wp.zeros(n, dtype=wp.vec3, device=device, requires_grad=True)
-        mean_pixel = wp.zeros(n, dtype=wp.vec2, device=device, requires_grad=True)
         depth = wp.zeros(n, dtype=wp.float32, device=device)
+        radii = wp.zeros(n, dtype=wp.vec2, device=device)
         tile_rect = wp.zeros(n, dtype=wp.vec4i, device=device)
         tiles_touched = wp.zeros(n, dtype=wp.int32, device=device)
         offsets = wp.zeros(n, dtype=wp.int32, device=device)
@@ -457,6 +474,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
                         means_wp,
                         scales_wp,
                         quats_wp,
+                        mean_pixel,
                         view_matrix_arr,
                         fx,
                         fy,
@@ -467,7 +485,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
                         tiles_per_row,
                         tiles_per_col,
                     ],
-                    outputs=[cov2d_inv, mean_pixel, depth, tile_rect, tiles_touched],
+                    outputs=[cov2d_inv, depth, tile_rect, tiles_touched, radii],
                     device=device,
                 )
 
@@ -541,10 +559,12 @@ class WarpRasterizeFunction(torch.autograd.Function):
         ctx.owners = owners
         ctx.stream = stream
 
-        return wp.to_torch(image_wp)
+        radii_torch = wp.to_torch(radii)
+        ctx.mark_non_differentiable(radii_torch)
+        return wp.to_torch(image_wp), radii_torch
 
     @staticmethod
-    def backward(ctx, grad_image: torch.Tensor):  # type: ignore[override]
+    def backward(ctx, grad_image: torch.Tensor, _grad_radii: torch.Tensor | None):  # type: ignore[override]
 
         # torchから来た勾配をwp.arrayに変換する. contiguous()でメモリレイアウトを保証
         grad_image_wp = wp.from_torch(grad_image.contiguous(), dtype=wp.vec3)
@@ -597,8 +617,8 @@ class WarpRasterizeFunction(torch.autograd.Function):
                 device=device,
             )
 
-            # preprocess_kernelの部分だけ逆伝播
-            ctx.tape.backward(grads={cov2d_inv: grad_cov2d_inv, mean_pixel: grad_mean_pixel})
+            # 共分散の投影だけWarpで逆伝播する。2D中心の勾配はPyTorch側へ返す
+            ctx.tape.backward(grads={cov2d_inv: grad_cov2d_inv})
 
         result_arrays = (means_wp.grad, quats_wp.grad, scales_wp.grad, grad_opacities, grad_colors)
 
@@ -610,8 +630,8 @@ class WarpRasterizeFunction(torch.autograd.Function):
             else:
                 gradients.append(None)
 
+        grad_means2d = wp.to_torch(grad_mean_pixel).clone().unsqueeze(0) if ctx.needs_input_grad[5] else None
         ctx.tape.zero()
 
         # forwardの引数の順序・個数に合わせてタプルで返す
-        # w2c, fx, fy, cx, cy, H, W, bg_colorは勾配不要なのでNone
-        return (*gradients, None, None, None, None, None, None)
+        return (*gradients, grad_means2d, None, None, None, None, None)
