@@ -112,7 +112,7 @@ uv run train --data_dir data\nerf_example_data\nerf_synthetic\lego --output_dir 
 
 指定した `--output_dir` には、次のファイルが保存されます。
 
-- `images/step_*.png`: 正解画像（左）と学習結果（右）の比較画像
+- `images/step_*.png`: test split の固定視点の正解画像（左）と学習結果（右）の比較画像
 - `ckpts/step_*.pth`: 学習途中のチェックポイント
 - `final.ply`: 学習後のガウシアンを保存した PLY ファイル
-- `training_curves.png`: 損失、PSNR、ガウシアン数の推移
+- `training_curves.png`: 損失、test split 全画像の平均 PSNR（100ステップごと）、ガウシアン数の推移

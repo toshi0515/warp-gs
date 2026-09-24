@@ -66,6 +66,62 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     return psnr.item()
 
 
+def render_test_view(model, renderer, test_loader, idx, bg_color, device):
+    target, w2c, K = test_loader.get_by_index(idx)
+    pred = renderer.render(
+        model,
+        w2c.to(device),
+        K.to(device),
+        test_loader.H,
+        test_loader.W,
+        bg_color,
+    ).image.clamp(0, 1)
+    return target.to(device), pred
+
+
+@torch.no_grad()
+def evaluate_test_psnr(model, renderer, test_loader, bg_color, device):
+    model.eval()
+    psnrs = []
+    for idx in range(test_loader.N):
+        target, pred = render_test_view(model, renderer, test_loader, idx, bg_color, device)
+        psnrs.append(compute_psnr(pred, target))
+    return float(np.mean(psnrs))
+
+
+def make_training_curves(loss_history, psnr_history, n_gauss_history):
+    import matplotlib
+
+    matplotlib.use("Agg")  # GUI なし
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.patch.set_facecolor("#1a1a2e")
+
+    axes[0].plot(range(1, len(loss_history) + 1), loss_history, color="#00bfff", linewidth=0.8)
+    axes[0].set_title("Loss曲線", color="white")
+    axes[0].set_yscale("log")
+    axes[0].set_facecolor("#0d0d1a")
+    axes[0].tick_params(colors="gray")
+
+    axes[1].plot([i * 100 for i in range(1, len(psnr_history) + 1)], psnr_history, color="#00ff88", linewidth=1.5)
+    axes[1].set_title("Test PSNR (dB)", color="white")
+    axes[1].set_facecolor("#0d0d1a")
+    axes[1].tick_params(colors="gray")
+
+    axes[2].plot(range(1, len(n_gauss_history) + 1), n_gauss_history, color="#ffaa00", linewidth=0.8)
+    axes[2].set_title("ガウシアン数", color="white")
+    axes[2].set_facecolor("#0d0d1a")
+    axes[2].tick_params(colors="gray")
+
+    for ax in axes:
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#333355")
+
+    fig.tight_layout()
+    return fig, axes
+
+
 # メイン学習ループ
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,6 +129,7 @@ def train(args):
 
     # データロード
     train_loader = NeRFSyntheticDataloader(args.data_dir, split="train", downscale=args.downscale, device=device)
+    test_loader = NeRFSyntheticDataloader(args.data_dir, split="test", downscale=args.downscale, device="cpu")
     H, W = train_loader.H, train_loader.W
     print(f"[train] image size: {H}x{W}, device: {device}")
 
@@ -137,7 +194,7 @@ def train(args):
         n_gauss_history.append(model.num_gaussians())
 
         if step % 100 == 0:
-            psnr = compute_psnr(pred_img.detach(), target_img)
+            psnr = evaluate_test_psnr(model, renderer, test_loader, bg_color, device)
             psnr_history.append(psnr)
             elapsed = time.time() - start_time
             print(
@@ -152,10 +209,9 @@ def train(args):
         if step % args.save_img_interval == 0 or step == args.n_iters:
             model.eval()
             with torch.no_grad():
-                # テスト用に固定カメラ (index 0) でレンダリング
-                test_img, test_w2c, test_K = train_loader.get_by_index(0)
-                pred_test = renderer.render(model, test_w2c, test_K, H, W, bg_color).image
-                pred_np = pred_test.clamp(0, 1).cpu().numpy()
+                # test split の固定視点 (index 0) を表示
+                test_img, pred_test = render_test_view(model, renderer, test_loader, 0, bg_color, device)
+                pred_np = pred_test.cpu().numpy()
                 target_np = test_img.cpu().numpy()
 
             # 並べて保存
@@ -175,36 +231,11 @@ def train(args):
     print(f"最終ガウシアン数: {model.num_gaussians()}")
 
     # 学習曲線の保存
-    import matplotlib
-
-    matplotlib.use("Agg")  # GUI なし
+    fig, _ = make_training_curves(loss_history, psnr_history, n_gauss_history)
+    fig.savefig(str(out_dir / "training_curves.png"), dpi=150, facecolor="#1a1a2e")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.patch.set_facecolor("#1a1a2e")
-
-    axes[0].plot(loss_history, color="#00bfff", linewidth=0.8)
-    axes[0].set_title("Loss曲線", color="white")
-    axes[0].set_yscale("log")
-    axes[0].set_facecolor("#0d0d1a")
-    axes[0].tick_params(colors="gray")
-
-    axes[1].plot([i * 100 for i in range(len(psnr_history))], psnr_history, color="#00ff88", linewidth=1.5)
-    axes[1].set_title("PSNR (dB)", color="white")
-    axes[1].set_facecolor("#0d0d1a")
-    axes[1].tick_params(colors="gray")
-
-    axes[2].plot(n_gauss_history, color="#ffaa00", linewidth=0.8)
-    axes[2].set_title("ガウシアン数", color="white")
-    axes[2].set_facecolor("#0d0d1a")
-    axes[2].tick_params(colors="gray")
-
-    for ax in axes:
-        for sp in ax.spines.values():
-            sp.set_edgecolor("#333355")
-
-    plt.tight_layout()
-    plt.savefig(str(out_dir / "training_curves.png"), dpi=150, facecolor="#1a1a2e")
+    plt.close(fig)
     print(f"学習曲線 → {out_dir}/training_curves.png")
 
 
