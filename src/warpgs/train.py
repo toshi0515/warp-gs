@@ -8,10 +8,9 @@ import torch
 import torch.nn.functional as F
 
 from warpgs.dataset import NeRFSyntheticDataloader
-from warpgs.densification import Densification
 from warpgs.model import GaussianModel, create_optimizers
 from warpgs.ply import save_ply
-from warpgs.renderers import create_renderer
+from warpgs.renderers import create_renderer, ensure_gsplat_available
 
 
 # 損失関数
@@ -144,15 +143,23 @@ def train(args):
             device=device,
         )
     optimizers = create_optimizers(model)
-    controller = Densification(args.renderer, args.densification, args)
-    renderer = create_renderer(
-        args.renderer,
-        packed=args.packed,
-        absgrad=args.absgrad and args.renderer == "gsplat" and args.densification == "default",
-    )
-    controller.check_sanity(model, optimizers)
+    ensure_gsplat_available()
+    from gsplat.strategy import MCMCStrategy
 
-    print(f"[train] renderer={renderer.name}, densification={controller.name}, initial Gaussians={model.num_gaussians()}")
+    strategy = MCMCStrategy(
+        cap_max=args.max_gaussians,
+        noise_lr=args.mcmc_noise_lr,
+        refine_start_iter=max(0, args.densify_from - 1),
+        refine_stop_iter=args.densify_until + 1,
+        refine_every=args.densify_interval,
+        min_opacity=args.opacity_threshold,
+        verbose=True,
+    )
+    strategy_state = strategy.initialize_state()
+    strategy.check_sanity(model.params, optimizers)
+    renderer = create_renderer(args.renderer, packed=args.packed)
+
+    print(f"[train] renderer={renderer.name}, densification=gsplat-mcmc, initial Gaussians={model.num_gaussians()}")
     # 出力ディレクトリ
     out_dir = Path(args.output_dir)
     (out_dir / "images").mkdir(parents=True, exist_ok=True)
@@ -174,9 +181,11 @@ def train(args):
 
         render_output = renderer.render(model, w2c, K, H, W, bg_color)
         pred_img = render_output.image
-        controller.before_backward(model, optimizers, step, render_output)
-
-        loss = combined_loss(pred_img, target_img) + controller.regularization(model)
+        loss = (
+            combined_loss(pred_img, target_img)
+            + args.opacity_reg * model.opacities.mean()
+            + args.scale_reg * model.scales.mean()
+        )
 
         # バックワードパス
         loss.backward()
@@ -186,7 +195,16 @@ def train(args):
 
         model.normalize_quats()
         # gsplat 1.5.3 の公式 trainer と同じく optimizer 更新後に呼ぶ。
-        controller.after_backward(model, optimizers, step, render_output)
+        means_lr = float(optimizers["means"].param_groups[0]["lr"])
+        # MCMCStrategy は描画メタデータを参照しない。
+        strategy.step_post_backward(
+            model.params,
+            optimizers,
+            strategy_state,
+            step,
+            {},
+            lr=means_lr if step <= args.mcmc_noise_until else 0.0,
+        )
 
         # ログ
         loss_val = loss.item()
@@ -258,18 +276,10 @@ def parse_args():
         default=False,
         help="gsplat packed rasterization (Warp では無視)",
     )
-    p.add_argument("--absgrad", action="store_true", help="gsplat DefaultStrategy で absolute gradient を使う")
-    # Densification
-    p.add_argument(
-        "--densification",
-        choices=("default", "mcmc"),
-        default="mcmc",
-        help="gsplat DefaultStrategy または MCMCStrategy",
-    )
+    # MCMC によるガウシアンの増減
     p.add_argument("--densify_from", type=int, default=500)
     p.add_argument("--densify_until", type=int, default=7_500)
     p.add_argument("--densify_interval", type=int, default=100)
-    p.add_argument("--grad_threshold", type=float, default=0.0002)
     p.add_argument("--opacity_threshold", type=float, default=0.005)
     p.add_argument("--max_gaussians", type=int, default=150_000)
     # 3DGS MCMC

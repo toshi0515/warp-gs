@@ -8,7 +8,7 @@
 ## AIの利用
 
 最初は3DGSビューアのみを作っていたので一部はAIで作成しました
-- AIを利用した部分(plyファイルを生成するため)：train.py, model.py, densification.py, dataset.py
+- AIを利用した部分(plyファイルを生成するため)：train.py, model.py, dataset.py
 - AIを利用せず完全に手書きの部分：viewers/内の各ビューア, viewer_base.py, my_warp_rasterizer.py
 
 ---
@@ -100,14 +100,13 @@ uv run train --data_dir data\nerf_example_data\nerf_synthetic\lego --output_dir 
 | `--n_iters N` | 学習ステップ数 | `10000` |
 | `--downscale N` | 画像の縮小率。大きいほど軽くなります | `1` |
 | `--renderer {warp,gsplat}` | 使用するレンダラー | `warp` |
-| `--densification {default,mcmc}` | ガウシアンを増減させる方法(Densification) | `mcmc` |
 | `--num_init_gaussians N` | 学習開始時のガウシアン数 | `5000` |
 | `--init_checkpoint PATH` | 既存のチェックポイントを初期値として使う | 指定なし |
 
-たとえば gsplat レンダラーと標準の増減方法(Densification)を使う場合は、次のように指定します。
+gsplat レンダラーを使う場合は、次のように指定します。ガウシアンの増減には MCMC を使います。
 
 ```powershell
-uv run train --data_dir data\nerf_example_data\nerf_synthetic\lego --output_dir outputs\gsplat-lego --renderer gsplat --densification default
+uv run train --data_dir data\nerf_example_data\nerf_synthetic\lego --output_dir outputs\gsplat-lego --renderer gsplat
 ```
 
 指定した `--output_dir` には、次のファイルが保存されます。

@@ -1,11 +1,9 @@
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
-from warpgs.densification import Densification
 from warpgs.model import PARAM_KEYS, GaussianModel, create_optimizers
 
 
@@ -51,10 +49,4 @@ def test_optimizer_layout_is_accepted_by_gsplat() -> None:
         assert len(optimizer.param_groups[0]["params"]) == 1
         assert optimizer.param_groups[0]["params"][0] is model.params[name]
 
-    strategy_module.DefaultStrategy().check_sanity(model.params, optimizers)
     strategy_module.MCMCStrategy().check_sanity(model.params, optimizers)
-
-
-def test_warp_default_absgrad_is_explicitly_unsupported() -> None:
-    with pytest.raises(ValueError, match="absgrad"):
-        Densification("warp", "default", SimpleNamespace(absgrad=True))

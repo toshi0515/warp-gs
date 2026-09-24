@@ -37,23 +37,17 @@ def test_renderer_shapes_finite_and_gradients() -> None:
     )
     background = torch.ones(3, device="cuda")
 
-    for renderer in (WarpRenderer(), gsplat_renderer):
+    for renderer in (WarpRenderer(), gsplat_renderer, GsplatRenderer(packed=True)):
         model = cuda_model()
         output = renderer.render(model, w2c, K, 32, 32, background)
         assert output.image.shape == (32, 32, 3)
         assert torch.isfinite(output.image).all()
-        assert output.info["means2d"].shape == (1, 2, 2)
-        assert output.info["radii"].shape == (1, 2, 2)
-        assert torch.count_nonzero(output.info["radii"]) > 0
-        output.info["means2d"].retain_grad()
         if output.alpha is not None:
             assert output.alpha.shape == (32, 32, 1)
             assert torch.all((0 <= output.alpha) & (output.alpha <= 1))
         output.image.sum().backward()
-        assert output.info["means2d"].grad is not None
-        assert torch.isfinite(output.info["means2d"].grad).all()
-        assert torch.count_nonzero(output.info["means2d"].grad) > 0
         for parameter in model.params.values():
             assert parameter.grad is not None
             assert parameter.grad.shape == parameter.shape
             assert torch.isfinite(parameter.grad).all()
+        assert torch.count_nonzero(model.means.grad) > 0

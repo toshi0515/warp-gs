@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 
@@ -10,7 +9,6 @@ from warpgs.model import GaussianModel
 class RenderOutput:
     image: torch.Tensor
     alpha: torch.Tensor | None
-    info: dict[str, Any]
 
 
 class WarpRenderer:
@@ -30,40 +28,29 @@ class WarpRenderer:
         width: int,
         background: torch.Tensor,
     ) -> RenderOutput:
-        from warpgs.my_warp_rasterizer import WarpRasterizeFunction, project_means_to_screen
+        from warpgs.my_warp_rasterizer import WarpRasterizeFunction
 
-        means2d = project_means_to_screen(model.means, w2c, K)
-        image, radii = WarpRasterizeFunction.apply(
+        image = WarpRasterizeFunction.apply(
             model.means,
             model.quats,
             model.scales,
             model.opacities,
             model.colors,
-            means2d,
             w2c,
             K,
             height,
             width,
             background,
         )
-        info = {
-            "means2d": means2d,
-            "radii": radii[None],
-            "width": width,
-            "height": height,
-            "n_cameras": 1,
-            "gaussian_ids": None,
-        }
-        return RenderOutput(image, None, info)
+        return RenderOutput(image, None)
 
 
 class GsplatRenderer:
     name = "gsplat"
 
-    def __init__(self, packed: bool = False, absgrad: bool = False) -> None:
+    def __init__(self, packed: bool = False) -> None:
         ensure_gsplat_available()
         self.packed = packed
-        self.absgrad = absgrad
 
     def render(
         self,
@@ -76,7 +63,7 @@ class GsplatRenderer:
     ) -> RenderOutput:
         from gsplat.rendering import rasterization
 
-        image, alpha, info = rasterization(
+        image, alpha, _ = rasterization(
             means=model.means,
             quats=model.quats,
             scales=model.scales,
@@ -86,11 +73,10 @@ class GsplatRenderer:
             Ks=K[None],
             width=width,
             height=height,
-            backgrounds=background[None],
             packed=self.packed,
-            absgrad=self.absgrad,
         )
-        return RenderOutput(image[0], alpha[0], info)
+        image = image[0] + (1.0 - alpha[0]) * background
+        return RenderOutput(image, alpha[0])
 
 
 def ensure_gsplat_available() -> None:
@@ -105,7 +91,7 @@ def ensure_gsplat_available() -> None:
         ) from error
 
 
-def create_renderer(name: str, packed: bool = False, absgrad: bool = False) -> WarpRenderer | GsplatRenderer:
+def create_renderer(name: str, packed: bool = False) -> WarpRenderer | GsplatRenderer:
     if name == "warp":
         return WarpRenderer()
-    return GsplatRenderer(packed, absgrad)
+    return GsplatRenderer(packed)
