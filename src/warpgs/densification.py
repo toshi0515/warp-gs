@@ -1,5 +1,3 @@
-"""Small adapter around gsplat's densification strategies."""
-
 from typing import Any
 
 import torch
@@ -12,8 +10,7 @@ class Densification:
     def __init__(self, renderer: str, kind: str, args) -> None:
         if renderer == "warp" and kind == "default" and args.absgrad:
             raise ValueError(
-                "warp + default does not support --absgrad. "
-                "Use the standard gradient or select the gsplat renderer."
+                "warp + default does not support --absgrad. Use the standard gradient or select the gsplat renderer."
             )
 
         ensure_gsplat_available()

@@ -1,5 +1,3 @@
-"""Warp and gsplat renderer wrappers."""
-
 from dataclasses import dataclass
 from typing import Any
 
@@ -103,8 +101,7 @@ def ensure_gsplat_available() -> None:
             raise RuntimeError("CUDA extension is not loaded")
     except Exception as error:
         raise RuntimeError(
-            "gsplat CUDA extension is unavailable. Run scripts/setup_gsplat_windows.ps1. "
-            f"Original error: {error}"
+            f"gsplat CUDA extension is unavailable. Run scripts/setup_gsplat_windows.ps1. Original error: {error}"
         ) from error
 
 

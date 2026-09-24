@@ -95,10 +95,7 @@ def train(args):
     )
     controller.check_sanity(model, optimizers)
 
-    print(
-        f"[train] renderer={renderer.name}, densification={controller.name}, "
-        f"initial Gaussians={model.num_gaussians()}"
-    )
+    print(f"[train] renderer={renderer.name}, densification={controller.name}, initial Gaussians={model.num_gaussians()}")
     # 出力ディレクトリ
     out_dir = Path(args.output_dir)
     (out_dir / "images").mkdir(parents=True, exist_ok=True)
@@ -213,7 +210,7 @@ def train(args):
 
 # 引数パーサー
 def parse_args():
-    root_dir = Path(__file__).resolve().parents[1]
+    root_dir = Path(__file__).resolve().parents[2]
     data_path = root_dir / "data" / "nerf_example_data" / "nerf_synthetic" / "lego"
     output_path = root_dir / "outputs" / "warp-lego"
     p = argparse.ArgumentParser(description="3DGS training on NeRF Synthetic")
@@ -255,6 +252,10 @@ def parse_args():
     return p.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
     train(args)
+
+
+if __name__ == "__main__":
+    main()

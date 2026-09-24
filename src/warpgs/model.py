@@ -1,5 +1,3 @@
-"""Gaussian parameters shared by the Warp and gsplat renderers."""
-
 import math
 from pathlib import Path
 
