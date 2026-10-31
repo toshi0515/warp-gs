@@ -23,12 +23,23 @@ def cuda_model() -> GaussianModel:
     return GaussianModel(means, quats, scales, opacities, colors)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required by both rasterizers")
-def test_renderer_shapes_finite_and_gradients() -> None:
-    try:
-        gsplat_renderer = GsplatRenderer(packed=False)
-    except RuntimeError as error:
-        pytest.skip(str(error))
+@pytest.mark.parametrize("backend", ["warp", "gsplat-unpacked", "gsplat-packed"])
+def test_renderer_shapes_finite_and_gradients(backend: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    if backend == "warp":
+
+        def unavailable_gsplat():
+            raise RuntimeError("Deliberately unavailable: Warp must remain independent of gsplat initialization")
+
+        monkeypatch.setattr("warpgs.renderers.ensure_gsplat_available", unavailable_gsplat)
+        pytest.importorskip("warp")
+        renderer = WarpRenderer()
+    else:
+        try:
+            renderer = GsplatRenderer(packed=backend == "gsplat-packed")
+        except RuntimeError as error:
+            pytest.skip(str(error))
 
     w2c = torch.eye(4, device="cuda")
     K = torch.tensor(
@@ -37,17 +48,16 @@ def test_renderer_shapes_finite_and_gradients() -> None:
     )
     background = torch.ones(3, device="cuda")
 
-    for renderer in (WarpRenderer(), gsplat_renderer, GsplatRenderer(packed=True)):
-        model = cuda_model()
-        output = renderer.render(model, w2c, K, 32, 32, background)
-        assert output.image.shape == (32, 32, 3)
-        assert torch.isfinite(output.image).all()
-        if output.alpha is not None:
-            assert output.alpha.shape == (32, 32, 1)
-            assert torch.all((0 <= output.alpha) & (output.alpha <= 1))
-        output.image.sum().backward()
-        for parameter in model.params.values():
-            assert parameter.grad is not None
-            assert parameter.grad.shape == parameter.shape
-            assert torch.isfinite(parameter.grad).all()
-        assert torch.count_nonzero(model.means.grad) > 0
+    model = cuda_model()
+    output = renderer.render(model, w2c, K, 32, 32, background)
+    assert output.image.shape == (32, 32, 3)
+    assert torch.isfinite(output.image).all()
+    if output.alpha is not None:
+        assert output.alpha.shape == (32, 32, 1)
+        assert torch.all((0 <= output.alpha) & (output.alpha <= 1))
+    output.image.sum().backward()
+    for parameter in model.params.values():
+        assert parameter.grad is not None
+        assert parameter.grad.shape == parameter.shape
+        assert torch.isfinite(parameter.grad).all()
+    assert torch.count_nonzero(model.means.grad) > 0

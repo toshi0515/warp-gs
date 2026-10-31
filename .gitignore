@@ -27,6 +27,7 @@ outputs/
 renders/
 nerf_example_data/
 *.npz
+!tests/baselines/phase0/expected.npz
 
 # zip / tar / 7z / rar / gz / bz2 / csv / tsv
 *.zip

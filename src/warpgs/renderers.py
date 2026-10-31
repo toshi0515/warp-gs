@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 
 from warpgs.model import GaussianModel
+from warpgs.raster_config import RasterConfig
 
 
 @dataclass
@@ -14,7 +15,10 @@ class RenderOutput:
 class WarpRenderer:
     name = "warp"
 
-    def __init__(self) -> None:
+    def __init__(self, config: RasterConfig | None = None) -> None:
+        if config is not None and not isinstance(config, RasterConfig):
+            raise TypeError("config must be a RasterConfig or None")
+        self.config = config if config is not None else RasterConfig()
         import warp as wp
 
         wp.init()
@@ -41,6 +45,7 @@ class WarpRenderer:
             height,
             width,
             background,
+            self.config,
         )
         return RenderOutput(image, None)
 

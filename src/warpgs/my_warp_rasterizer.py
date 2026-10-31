@@ -3,14 +3,32 @@ import math
 import torch
 import warp as wp
 
+from warpgs.raster_config import RasterConfig
+
 mat23f = wp.types.matrix(shape=(2, 3), dtype=wp.float32)
 
 TILE_SIZE = 16
-GAUSSIAN_EXTENT = 3.33
-MAX_ALPHA = 0.99
-ALPHA_THRESHOLD = 1.0 / 255.0
-TRANSMITTANCE_THRESHOLD = 1e-4
-NEAR_PLANE = 0.1
+
+
+@wp.struct
+class RasterConfigWP:
+    gaussian_extent: float
+    covariance_lowpass: float
+    jacobian_clamp_factor: float
+    alpha_cutoff: float
+    alpha_cap: float
+    transmittance_threshold: float
+    near_plane: float
+
+
+def make_warp_config(config: RasterConfig | None = None):
+    """Fresh by-value settings per forward; no shared mutable kernel globals."""
+    if config is not None and not isinstance(config, RasterConfig):
+        raise TypeError("config must be a RasterConfig or None")
+    result = RasterConfigWP()
+    for name, value in (config if config is not None else RasterConfig()).effective_values().items():
+        setattr(result, name, value)
+    return result
 
 
 @wp.func
@@ -51,6 +69,7 @@ def compute_gaussian_screen_data_wp(
     cy: float,
     screen_w: float,
     screen_h: float,
+    config: RasterConfigWP,
 ) -> GaussianScreenData:
     mean_h = wp.vec4(mean[0], mean[1], mean[2], 1.0)
     t_cam_h = view_matrix @ mean_h
@@ -60,8 +79,8 @@ def compute_gaussian_screen_data_wp(
     tz = t_cam_h[2]
 
     # tzの値によってJが大きくなりすぎるのを防ぐ
-    lim_x = 1.3 * 0.5 * screen_w / fx
-    lim_y = 1.3 * 0.5 * screen_h / fy
+    lim_x = config.jacobian_clamp_factor * 0.5 * screen_w / fx
+    lim_y = config.jacobian_clamp_factor * 0.5 * screen_h / fy
     tx_cov = tz * wp.clamp(tx / tz, -lim_x, lim_x)
     ty_cov = tz * wp.clamp(ty / tz, -lim_y, lim_y)
 
@@ -90,8 +109,8 @@ def compute_gaussian_screen_data_wp(
 
     cov_cam = W_rot @ cov3d @ wp.transpose(W_rot)
     cov2d = J @ cov_cam @ wp.transpose(J)
-    cov2d[0, 0] += 0.3
-    cov2d[1, 1] += 0.3
+    cov2d[0, 0] += config.covariance_lowpass
+    cov2d[1, 1] += config.covariance_lowpass
 
     a = cov2d[0, 0]
     b = cov2d[0, 1]
@@ -124,6 +143,7 @@ def preprocess_kernel(
     screen_h: float,
     tiles_per_row: int,
     tiles_per_col: int,
+    config: RasterConfigWP,
     # 出力 (すべて元のガウシアンインデックス tid で書き込む. サイズ N)
     out_cov2d_inv: wp.array[wp.vec3],
     out_mu_pixel: wp.array[wp.vec2],
@@ -142,17 +162,17 @@ def preprocess_kernel(
     t_cam_h = view_matrix @ mean_h
     tz = t_cam_h[2]
 
-    if tz <= NEAR_PLANE:
+    if tz <= config.near_plane:
         return
 
     scale = scales[tid]
     quat = quats[tid]
     cov3d = compute_cov3d_wp(scale, quat)
-    data = compute_gaussian_screen_data_wp(mean, cov3d, view_matrix, fx, fy, cx, cy, screen_w, screen_h)
+    data = compute_gaussian_screen_data_wp(mean, cov3d, view_matrix, fx, fy, cx, cy, screen_w, screen_h, config)
 
     #
-    radius_x = GAUSSIAN_EXTENT * wp.sqrt(wp.max(data.cov2d_diag[0], 0.0))
-    radius_y = GAUSSIAN_EXTENT * wp.sqrt(wp.max(data.cov2d_diag[1], 0.0))
+    radius_x = config.gaussian_extent * wp.sqrt(wp.max(data.cov2d_diag[0], 0.0))
+    radius_y = config.gaussian_extent * wp.sqrt(wp.max(data.cov2d_diag[1], 0.0))
 
     # 画面外に中心を持つ大きなGaussianも画像と交差する限り残す
     if data.mu_pixel[0] + radius_x <= 0.0 or data.mu_pixel[0] - radius_x >= screen_w:
@@ -251,6 +271,7 @@ def render_kernel(
     screen_h: int,
     tiles_per_row: int,
     bg_color: wp.vec3,
+    config: RasterConfigWP,
     image: wp.array2d[wp.vec3],  # 最終的なピクセルの色
     final_T: wp.array2d[wp.float32],  # 最終的な透過率
     last_contributor: wp.array2d[wp.int32],  # 最後に寄与したガウシアンのインデックス
@@ -286,18 +307,18 @@ def render_kernel(
         conic = cov2d_inv[gid]
         power = dx * dx * conic[0] + 2.0 * dx * dy * conic[1] + dy * dy * conic[2]
 
-        if power < 0.0 or power > GAUSSIAN_EXTENT * GAUSSIAN_EXTENT:
+        if power < 0.0 or power > config.gaussian_extent * config.gaussian_extent:
             continue
 
-        alpha = wp.min(MAX_ALPHA, opacities[gid] * wp.exp(-0.5 * power))
-        if alpha < ALPHA_THRESHOLD:
+        alpha = wp.min(config.alpha_cap, opacities[gid] * wp.exp(-0.5 * power))
+        if alpha < config.alpha_cutoff:
             continue
 
         accum = accum + colors[gid] * alpha * T
         T = T * (1.0 - alpha)
         last = i
 
-        if T < TRANSMITTANCE_THRESHOLD:
+        if T < config.transmittance_threshold:
             break
 
     final_color = accum + T * bg_color
@@ -324,6 +345,7 @@ def backward_render_kernel(
     screen_h: int,
     tiles_per_row: int,
     bg_color: wp.vec3,
+    config: RasterConfigWP,
     grad_cov2d_inv: wp.array[wp.vec3],
     grad_mean_pixel: wp.array[wp.vec2],
     grad_colors: wp.array[wp.vec3],
@@ -354,11 +376,11 @@ def backward_render_kernel(
         conic = cov2d_inv[gid]
         power = dx * dx * conic[0] + 2.0 * dx * dy * conic[1] + dy * dy * conic[2]
 
-        if power >= 0.0 and power <= GAUSSIAN_EXTENT * GAUSSIAN_EXTENT:
+        if power >= 0.0 and power <= config.gaussian_extent * config.gaussian_extent:
             gaussian = wp.exp(-0.5 * power)
             raw_alpha = opacities[gid] * gaussian
-            alpha = wp.min(MAX_ALPHA, raw_alpha)
-            if alpha >= ALPHA_THRESHOLD:
+            alpha = wp.min(config.alpha_cap, raw_alpha)
+            if alpha >= config.alpha_cutoff:
                 one_minus_alpha = 1.0 - alpha
                 transmittance_before = final_t / (one_minus_alpha * suffix_T)
                 color = colors[gid]
@@ -366,7 +388,7 @@ def backward_render_kernel(
                 grad_colors[gid] += grad * (alpha * transmittance_before)
                 grad_alpha = transmittance_before * wp.dot(grad, color - behind_color)
 
-                if raw_alpha < MAX_ALPHA:
+                if raw_alpha < config.alpha_cap:
                     grad_opacities[gid] += grad_alpha * gaussian
                     grad_power = -0.5 * grad_alpha * raw_alpha
                     grad_conic = wp.vec3(dx * dx, 2.0 * dx * dy, dy * dy) * grad_power
@@ -393,6 +415,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
         H: int,
         W: int,
         bg_color: torch.Tensor,
+        config: RasterConfig | None = None,
     ) -> torch.Tensor:
 
         # torch.TensorをWarpのwp.arrayに変換する. contiguous()でメモリレイアウトを保証
@@ -446,6 +469,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
         cx = float(K[0, 2].item())
         cy = float(K[1, 2].item())
 
+        settings = make_warp_config(config)
         tape = wp.Tape()
 
         with wp.ScopedStream(stream):
@@ -466,6 +490,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
                         float(H),
                         tiles_per_row,
                         tiles_per_col,
+                        settings,
                     ],
                     outputs=[cov2d_inv, mean_pixel, depth, tile_rect, tiles_touched],
                     device=device,
@@ -518,6 +543,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
                     H,
                     tiles_per_row,
                     bg_wp,
+                    settings,
                 ],
                 outputs=[image_wp, final_T, last_contributor],
                 device=device,
@@ -525,6 +551,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
 
         # backwardで再利用するものをctxに保存する
         ctx.tape = tape
+        ctx.config = settings
         ctx.input_arrays = (means_wp, quats_wp, scales_wp, opacities_wp, colors_wp)
         ctx.render_data = (
             tile_ranges,
@@ -592,6 +619,7 @@ class WarpRasterizeFunction(torch.autograd.Function):
                     H,
                     tiles_per_row,
                     bg_wp,
+                    ctx.config,
                 ],
                 outputs=[grad_cov2d_inv, grad_mean_pixel, grad_colors, grad_opacities],
                 device=device,
@@ -613,5 +641,5 @@ class WarpRasterizeFunction(torch.autograd.Function):
         ctx.tape.zero()
 
         # forwardの引数の順序・個数に合わせてタプルで返す
-        # w2c, fx, fy, cx, cy, H, W, bg_colorは勾配不要なのでNone
-        return (*gradients, None, None, None, None, None, None)
+        # Camera, intrinsics, dimensions, background and optional config have no gradient.
+        return (*gradients, *((None,) * (len(ctx.needs_input_grad) - 5)))

@@ -48,6 +48,9 @@ torch = { index = "pytorch" }
 line-length = 127
 target-version = "py312"
 
+[tool.pytest.ini_options]
+markers = ["cuda: requires compatible NVIDIA CUDA, PyTorch and the selected renderer"]
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
