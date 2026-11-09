@@ -8,9 +8,10 @@
 
 ## AIの利用
 
-最初は3DGSビューアのみを作っていたので一部はAIで作成しました
-- AIを利用した部分(plyファイルを生成するため)：train.py, model.py, dataset.py
-- AIを利用せず完全に手書きの部分：viewers/内の各ビューア, viewer_base.py, my_warp_rasterizer.py
+最初は3DGSビューアのみを作っていたので一部はAIで作成しました.
+- AIを利用した部分(plyファイルを生成するため)：train.py, model.py, dataset.py, README
+- AIを利用せず手書きの部分：viewers/内の各ビューア, viewer_base.py, my_warp_rasterizer.py
+（デバッグ作業で一部AIを利用した部分もあります．）
 
 ---
 
